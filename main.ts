@@ -3,9 +3,9 @@
 //
 // Idea: a full-size round trip costs roughly 26 bps in fees, slippage and
 // price impact, so casual trading bleeds money. This bot stays in cash and
-// waits for a real dip: the latest close has to sit well under its recent
-// average (or the trailing drop has to be deep) AND the last bar must show
-// the fall pausing. Only then does it buy, with most of its cash, and it
+// waits for a real dip: a fast, deep drop over the last two hours whose
+// fall has visibly paused — the latest bar closes up and already lifted
+// off the recent low. Only then does it buy, with most of its cash, and it
 // leaves again on a modest take-profit, a trailing give-back, a stop-loss
 // or a time stop — whichever comes first. Few trades, each one planned.
 
@@ -15,18 +15,21 @@ import type { BarsState, OrderInput } from './vendor/makefun-bars.ts';
 const SYMBOL = 'CBBTC';
 
 // ---- tunables (basis points unless the name says otherwise) ----
-const BASELINE_BARS = 90; // closes in the average a dip is measured against
-const DIP_BPS = 55; // buy when the close is this far under the baseline
+// v2 (after the first local grade lost money): the v1 trigger — "close a
+// little under its 90-bar average" — fired twice in a slow sideways bleed
+// where no real dip existed, and those two trades ate the one good trade.
+// The trigger is now a fast drop plus a visible lift off the low.
 const DROP_LOOKBACK = 120; // bars in the trailing-drop measurement
-const DROP_BPS = 65; // ...or when that trailing drop is at least this deep
-const KNIFE_BPS = 70; // skip entries while the baseline falls faster than this
-const KNIFE_LOOKBACK = 30; // bars over which the baseline's fall is measured
-const TAKE_PROFIT_BPS = 60; // sell when the position is worth this over cost
-const STOP_LOSS_BPS = 110; // sell when it is worth this under cost
-const TRAIL_ARM_BPS = 45; // trailing exit arms once the gain reaches this
-const TRAIL_GIVEBACK_BPS = 35; // ...and fires this far under the peak value
-const MAX_HOLD_BARS = 360; // time stop: never hold longer than this
-const COOLDOWN_BARS = 45; // flat bars to wait after an exit before re-entry
+const DROP_BPS = 85; // buy only after a drop at least this deep, this fast
+const LIFT_BPS = 12; // the close must already be this far off the recent low
+const LIFT_WINDOW = 10; // bars the recent low is taken over
+const TAKE_PROFIT_BPS = 55; // sell when the position is worth this over cost
+const STOP_LOSS_BPS = 85; // sell when it is worth this under cost
+const TRAIL_ARM_BPS = 40; // trailing exit arms once the gain reaches this
+const TRAIL_GIVEBACK_BPS = 30; // ...and fires this far under the peak value
+const MAX_HOLD_BARS = 300; // time stop: never hold longer than this
+const COOLDOWN_BARS = 60; // flat bars to wait after an exit before re-entry
+const STOP_COOLDOWN_BARS = 120; // ...and twice that after a stop-loss exit
 const SPEND_BPS = 9_700; // share of the cash balance one buy uses, of 10_000
 const ORDER_SLIPPAGE_BPS = 200; // max_slippage_bps sent with every order
 const LAST_ENTRY_SEQ = 1_380; // no fresh entries this late in a 1,440 bar window
@@ -36,6 +39,7 @@ const closes: number[] = []; // recent closes, oldest first, as plain numbers
 let entrySeq = -1; // batch seq on which the open position was decided
 let peakRatio = 0; // best value/cost ratio seen for the open position
 let lastExitSeq = -10_000; // batch seq of the last decided exit
+let cooldownBars = COOLDOWN_BARS; // bars to wait after that exit (longer after a stop)
 let pendingSince = -1; // seq a buy or sell was decided on, awaiting its fill
 
 function pushClose(state: BarsState): void {
@@ -45,30 +49,18 @@ function pushClose(state: BarsState): void {
   if (closes.length > 600) closes.shift();
 }
 
-function meanOfLast(n: number): number {
-  let sum = 0;
-  for (let i = closes.length - n; i < closes.length; i++) sum += closes[i]!;
-  return sum / n;
-}
-
-/** True when the dip is real and the fall looks paused on the latest bar. */
+/** True after a fast drop whose fall has visibly paused on the latest bars. */
 function dipSetup(): boolean {
   const n = closes.length;
-  if (n < Math.max(BASELINE_BARS, DROP_LOOKBACK) + KNIFE_LOOKBACK) return false;
+  if (n < DROP_LOOKBACK + LIFT_WINDOW) return false;
   const last = closes[n - 1]!;
   const prev = closes[n - 2]!;
-  if (last < prev) return false; // still falling on the latest bar: wait
-  const baseline = meanOfLast(BASELINE_BARS);
-  const underBaseline = ((baseline - last) / baseline) * 10_000 >= DIP_BPS;
-  const trailing = ((closes[n - 1 - DROP_LOOKBACK]! - last) / closes[n - 1 - DROP_LOOKBACK]!) * 10_000;
-  const deepDrop = trailing >= DROP_BPS;
-  if (!underBaseline && !deepDrop) return false;
-  // Knife guard: a baseline that is itself sliding fast means the dip is
-  // part of a slide, not a pause in one.
-  let oldSum = 0;
-  for (let i = n - KNIFE_LOOKBACK - BASELINE_BARS; i < n - KNIFE_LOOKBACK; i++) oldSum += closes[i]!;
-  const oldBaseline = oldSum / BASELINE_BARS;
-  if (((oldBaseline - baseline) / oldBaseline) * 10_000 > KNIFE_BPS) return false;
+  if (last <= prev) return false; // the latest bar must close up, not flat/down
+  const ref = closes[n - 1 - DROP_LOOKBACK]!;
+  if (((ref - last) / ref) * 10_000 < DROP_BPS) return false; // drop too shallow
+  let low = Infinity;
+  for (let i = n - LIFT_WINDOW; i < n; i++) if (closes[i]! < low) low = closes[i]!;
+  if (((last - low) / low) * 10_000 < LIFT_BPS) return false; // still on the low
   return true;
 }
 
@@ -98,13 +90,15 @@ function onBatch(state: BarsState, batch: { seq: number }): OrderInput[] {
     if (takeProfit || stopLoss || trailed || timedOut) {
       pendingSince = batch.seq;
       lastExitSeq = batch.seq;
+      // A stop-loss means the dip was not finished falling: sit out longer.
+      cooldownBars = stopLoss ? STOP_COOLDOWN_BARS : COOLDOWN_BARS;
       return [{ side: 'sell', symbol: SYMBOL, qty: pos.qty, max_slippage_bps: ORDER_SLIPPAGE_BPS }];
     }
     return [];
   }
 
   // Flat: look for the next dip, respecting the cooldown and the late window.
-  if (batch.seq - lastExitSeq < COOLDOWN_BARS) return [];
+  if (batch.seq - lastExitSeq < cooldownBars) return [];
   if (batch.seq > LAST_ENTRY_SEQ) return [];
   if (!dipSetup()) return [];
   const spend = (state.cash * BigInt(SPEND_BPS)) / 10_000n;
